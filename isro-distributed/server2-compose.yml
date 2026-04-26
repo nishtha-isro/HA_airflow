@@ -1,0 +1,160 @@
+# SERVER 2 — 10.61.247.143
+# Roles: etcd2, pg-node2 (replica), redis-replica1, redis-sentinel2, git-sync, scheduler2, worker, worker2
+
+x-airflow-common: &airflow-common
+  image: airflow-ha:2.7.3   # <-- same image loaded from tar on this server too
+  environment: &airflow-env
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@10.61.247.142:5432/airflow
+    - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@10.61.247.142:5432/airflow
+    - AIRFLOW__CELERY__BROKER_URL=sentinel://10.61.247.142:26379/0;sentinel://10.61.247.143:26379/0;sentinel://10.61.247.144:26379/0
+    - AIRFLOW__CELERY__BROKER_TRANSPORT_OPTIONS={"master_name":"mymaster","sentinel_kwargs":{"password":"redispassword"}}
+    - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+    - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    - AIRFLOW__WEBSERVER__SECRET_KEY=9a8b7c6d5e4f3g2h1i0j9k8l7m6n5o4p
+    - AIRFLOW__LOGGING__REMOTE_LOGGING=True
+    - AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID=minio_s3_conn
+    - AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER=s3://airflow-logs
+  volumes:
+    - dags-volume:/opt/airflow/dags
+    - ./config/airflow.cfg:/opt/airflow/airflow.cfg
+
+services:
+
+  # ── etcd node 2 ────────────────────────────────────────────
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.12
+    restart: always
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ETCD_NAME=etcd2
+      - ETCD_INITIAL_CLUSTER=etcd1=http://10.61.247.142:2380,etcd2=http://10.61.247.143:2380,etcd3=http://10.61.247.144:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://10.61.247.143:2379
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://10.61.247.143:2380
+      - ETCD_ALLOW_NONE_AUTHENTICATION=yes
+
+  # ── Postgres node 2 (Patroni replica) ──────────────────────
+  fix-permissions:
+    image: busybox
+    user: root
+    volumes:
+      - pgdata2:/data2
+    command: sh -c "chown -R 1000:1000 /data2"
+
+  pg-node2:
+    image: ongres/patroni:latest
+    restart: always
+    ports:
+      - "5432:5432"
+      - "8008:8008"
+    depends_on:
+      fix-permissions:
+        condition: service_completed_successfully
+    environment:
+      PATRONI_NAME: pg-node2
+      PATRONI_CONFIGURATION: |
+        scope: airflow
+        name: pg-node2
+        etcd3:
+          hosts: 10.61.247.142:2379,10.61.247.143:2379,10.61.247.144:2379
+        bootstrap:
+          method: initdb
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            postgresql:
+              use_pg_rewind: true
+              parameters:
+                wal_level: replica
+                hot_standby: "on"
+                max_wal_senders: 10
+                max_replication_slots: 10
+                max_connections: 100
+              pg_hba:
+                - host replication replicator 0.0.0.0/0 md5
+                - host all all 0.0.0.0/0 md5
+                - local all all trust
+        postgresql:
+          listen: 0.0.0.0:5432
+          connect_address: 10.61.247.143:5432
+          data_dir: /data/db
+          bin_dir: /usr/lib/postgresql/17.2/bin
+          pgpass: /tmp/pgpass
+          authentication:
+            replication: {username: replicator, password: replicatorpassword}
+            superuser: {username: airflow, password: airflow}
+        restapi:
+          listen: 0.0.0.0:8008
+          connect_address: 10.61.247.143:8008
+    command: patroni
+    volumes:
+      - pgdata2:/data
+
+  # ── Redis Replica 1 (replicates from primary on Server 1) ──
+  redis-replica1:
+    image: redis:7.0
+    restart: always
+    # connects to redis-primary on Server 1 by IP
+    command: redis-server --replicaof 10.61.247.142 6379 --requirepass redispassword --masterauth redispassword
+
+  # ── Redis Sentinel 2 ────────────────────────────────────────
+  # NOTE: sentinel.conf on this server must use 10.61.247.142 as the primary IP
+  # See the guide for the modified sentinel.conf for Server 2 & 3
+  redis-sentinel2:
+    image: redis:7.0
+    restart: always
+    ports:
+      - "26379:26379"
+    volumes:
+      - ./redis-config/sentinel.conf:/etc/sentinel.conf
+    command: redis-sentinel /etc/sentinel.conf
+
+  # ── git-sync (DAGs for workers on this server) ─────────────
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.2.1
+    restart: always
+    environment:
+      - GITSYNC_REPO=https://github.com/nishtha-isro/my-airflow-dags.git
+      - GITSYNC_BRANCH=main
+      - GITSYNC_PERIOD=30s
+      - GITSYNC_ROOT=/git
+      - GITSYNC_DEST=dags
+    volumes:
+      - dags-volume:/git
+
+  # ── Scheduler 2 (Active-Active HA with scheduler on Server 1) ─
+  scheduler2:
+    <<: *airflow-common
+    restart: always
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting for DB...'; sleep 2; done;
+             airflow scheduler"
+
+  # ── Worker 1 ────────────────────────────────────────────────
+  worker:
+    <<: *airflow-common
+    restart: always
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting for DB...'; sleep 2; done;
+             airflow celery worker"
+
+  # ── Worker 2 ────────────────────────────────────────────────
+  worker2:
+    <<: *airflow-common
+    restart: always
+    environment:
+      <<: *airflow-env
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: "4"
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting for DB...'; sleep 2; done;
+             airflow celery worker"
+
+volumes:
+  dags-volume:
+  pgdata2:

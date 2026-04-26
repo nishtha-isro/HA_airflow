@@ -1,0 +1,224 @@
+# SERVER 1 — 10.61.247.142
+# Roles: etcd1, pg-node1, haproxy, redis-primary, redis-sentinel1, minio, git-sync, webserver, scheduler, flower, airflow-init
+
+x-airflow-common: &airflow-common
+  image: airflow-ha:2.7.3   # <-- tag your loaded image: docker tag <id> airflow-ha:2.7.3
+  environment: &airflow-env
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@10.61.247.142:5432/airflow
+    - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@10.61.247.142:5432/airflow
+    - AIRFLOW__CELERY__BROKER_URL=sentinel://10.61.247.142:26379/0;sentinel://10.61.247.143:26379/0;sentinel://10.61.247.144:26379/0
+    - AIRFLOW__CELERY__BROKER_TRANSPORT_OPTIONS={"master_name":"mymaster","sentinel_kwargs":{"password":"redispassword"}}
+    - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+    - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    - AIRFLOW__WEBSERVER__SECRET_KEY=9a8b7c6d5e4f3g2h1i0j9k8l7m6n5o4p
+    - AIRFLOW__WEBSERVER__WORKERS=2
+    - AIRFLOW__LOGGING__REMOTE_LOGGING=True
+    - AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID=minio_s3_conn
+    - AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER=s3://airflow-logs
+  volumes:
+    - dags-volume:/opt/airflow/dags
+    - ./config/airflow.cfg:/opt/airflow/airflow.cfg
+
+services:
+
+  # ── etcd node 1 ────────────────────────────────────────────
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.12
+    restart: always
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ETCD_NAME=etcd1
+      - ETCD_INITIAL_CLUSTER=etcd1=http://10.61.247.142:2380,etcd2=http://10.61.247.143:2380,etcd3=http://10.61.247.144:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://10.61.247.142:2379
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://10.61.247.142:2380
+      - ETCD_ALLOW_NONE_AUTHENTICATION=yes
+
+  # ── Postgres node 1 (Patroni) ───────────────────────────────
+  fix-permissions:
+    image: busybox
+    user: root
+    volumes:
+      - pgdata1:/data1
+      - pg-sockets:/run-postgresql
+    command: sh -c "chown -R 1000:1000 /data1 /run-postgresql"
+
+  pg-node1:
+    image: ongres/patroni:latest
+    restart: always
+    ports:
+      - "5433:5432"
+      - "8008:8008"
+    depends_on:
+      fix-permissions:
+        condition: service_completed_successfully
+    environment:
+      PATRONI_NAME: pg-node1
+      PATRONI_CONFIGURATION: |
+        scope: airflow
+        name: pg-node1
+        etcd3:
+          hosts: 10.61.247.142:2379,10.61.247.143:2379,10.61.247.144:2379
+        bootstrap:
+          method: initdb
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            postgresql:
+              use_pg_rewind: true
+              parameters:
+                wal_level: replica
+                hot_standby: "on"
+                max_wal_senders: 10
+                max_replication_slots: 10
+                max_connections: 100
+              pg_hba:
+                - host replication replicator 0.0.0.0/0 md5
+                - host all all 0.0.0.0/0 md5
+                - local all all trust
+        postgresql:
+          listen: 0.0.0.0:5432
+          connect_address: 10.61.247.142:5432
+          data_dir: /data/db
+          bin_dir: /usr/lib/postgresql/17.2/bin
+          pgpass: /tmp/pgpass
+          authentication:
+            replication: {username: replicator, password: replicatorpassword}
+            superuser: {username: airflow, password: airflow}
+        restapi:
+          listen: 0.0.0.0:8008
+          connect_address: 10.61.247.142:8008
+    command: patroni
+    volumes:
+      - pgdata1:/data
+      - pg-sockets:/run/postgresql
+
+  # ── HAProxy — DB entry point for all Airflow nodes ──────────
+  # NOTE: haproxy.cfg on this server must use real IPs (see guide)
+  haproxy:
+    image: haproxy:latest
+    restart: always
+    ports:
+      - "5432:5432"
+      - "7000:7000"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    depends_on:
+      - pg-node1
+
+  # ── Redis Primary ────────────────────────────────────────────
+  redis-primary:
+    image: redis:7.0
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass redispassword
+
+  redis-sentinel1:
+    image: redis:7.0
+    restart: always
+    ports:
+      - "26379:26379"
+    volumes:
+      - ./redis-config/sentinel.conf:/etc/sentinel.conf
+    command: redis-sentinel /etc/sentinel.conf
+    depends_on:
+      - redis-primary
+
+  # ── MinIO (central log storage for all nodes) ───────────────
+  minio:
+    image: minio/minio:latest
+    restart: always
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    volumes:
+      - ./minio-data:/data
+    command: server /data --console-address ':9001'
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "sleep 5;
+        mc alias set local http://minio:9000 minioadmin minioadmin123;
+        mc mb local/airflow-logs --ignore-existing;
+        mc anonymous set download local/airflow-logs;"
+
+  # ── git-sync (DAGs) ─────────────────────────────────────────
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.2.1
+    restart: always
+    environment:
+      - GITSYNC_REPO=https://github.com/nishtha-isro/my-airflow-dags.git
+      - GITSYNC_BRANCH=main
+      - GITSYNC_PERIOD=30s
+      - GITSYNC_ROOT=/git
+      - GITSYNC_DEST=dags
+    volumes:
+      - dags-volume:/git
+
+  # ── Airflow Init (run ONCE to create DB tables) ─────────────
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting for DB...'; sleep 3; done;
+             airflow db migrate &&
+             airflow users create --username admin --password admin
+               --firstname Admin --lastname User --role Admin --email admin@isro.gov.in"
+    depends_on:
+      - haproxy
+
+  # ── Webserver ────────────────────────────────────────────────
+  webserver:
+    <<: *airflow-common
+    restart: always
+    ports:
+      - "8085:8080"
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow webserver"
+    depends_on:
+      - airflow-init
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /opt/airflow/airflow-webserver.pid ]"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  # ── Scheduler (primary) ─────────────────────────────────────
+  scheduler:
+    <<: *airflow-common
+    restart: always
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow scheduler"
+    depends_on:
+      - webserver
+
+  # ── Flower (Celery monitor) ──────────────────────────────────
+  flower:
+    <<: *airflow-common
+    restart: always
+    ports:
+      - "5557:5555"
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow celery flower"
+    depends_on:
+      - redis-sentinel1
+
+volumes:
+  dags-volume:
+  pgdata1:
+  pg-sockets:

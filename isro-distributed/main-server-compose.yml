@@ -1,0 +1,56 @@
+# MAIN SERVER — 10.61.241.85
+# Role: Image Registry + Management Console
+#
+# This server does NOT run Airflow.
+# It hosts a local Docker Registry so the 3 HA servers can pull images
+# directly over the network instead of manually loading tar files.
+#
+# USAGE:
+#   1. docker compose -f main-server-compose.yml up -d
+#   2. Push your built image to this registry (see steps below)
+#   3. On Server 1/2/3: update image name to 10.61.241.85:5000/airflow-ha:2.7.3
+
+services:
+
+  # ── Local Docker Registry ─────────────────────────────────────────────────
+  # Stores and serves Docker images to the 3 HA servers over the local network.
+  # Port 5000 must be accessible from 10.61.247.142, .143, .144
+  registry:
+    image: registry:2
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/data
+    volumes:
+      - registry-data:/data
+
+  # ── Registry UI (browse images in browser) ────────────────────────────────
+  # Access at: http://10.61.241.85:5001
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    restart: always
+    ports:
+      - "5001:80"
+    environment:
+      - REGISTRY_TITLE=ISRO Airflow Registry
+      - REGISTRY_URL=http://10.61.241.85:5000
+      - SINGLE_REGISTRY=true
+
+  # ── pgAdmin (optional — manage Patroni DB from browser) ──────────────────
+  # Access at: http://10.61.241.85:5050
+  # Connect it to 10.61.247.142:5432 (HAProxy → Patroni leader)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: always
+    ports:
+      - "5050:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@isro.gov.in
+      - PGADMIN_DEFAULT_PASSWORD=admin123
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+
+volumes:
+  registry-data:
+  pgadmin-data:
