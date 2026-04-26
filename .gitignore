@@ -1,0 +1,14 @@
+*.tar
+*.tar.gz
+pgdata/
+minio-data/
+redis-data/
+logs/
+*.log
+__pycache__/
+.env
+airflow-stack.tar
+airflow-all-images/
+airflow-all-images 2/
+*.tar
+*.zip

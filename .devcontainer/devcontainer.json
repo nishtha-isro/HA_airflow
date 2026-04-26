@@ -1,0 +1,29 @@
+{
+	"name": "Airflow Celery Environment",
+	"dockerComposeFile": "../docker-compose.yml",
+	"service": "webserver",
+	"workspaceFolder": "/usr/local/airflow",
+	"features": {
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-azuretools.vscode-docker"
+			]
+		}
+	},
+	"forwardPorts": [8085, 5557],
+	"portsAttributes": {
+		"8085": {
+			"label": "Airflow Webserver",
+			"onAutoForward": "notify"
+		},
+		"5557": {
+			"label": "Flower",
+			"onAutoForward": "notify"
+		}
+	},
+	"postCreateCommand": "docker-compose up -d"
+}
