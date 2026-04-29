@@ -1,0 +1,120 @@
+# =============================================================================
+# docker-compose-ha-server.yml
+# ISRO HA Airflow — HA SERVER  (10.61.247.142)
+#
+# YOUR REAL 2-SERVER SETUP:
+#   Main Server → 10.61.241.85  (all infrastructure — DB, Redis, Webserver, etc.)
+#   HA Server   → 10.61.247.142 (THIS FILE — only Workers + git-sync)
+#
+# SERVICES ON THIS SERVER:
+#   - git-sync  : pulls DAGs from GitHub (same repo as Main server)
+#   - worker    : Celery Worker 1
+#   - worker2   : Celery Worker 2
+#   - worker3   : Celery Worker 3
+#
+# BEFORE RUNNING:
+#   1. Copy the same airflow-ha.tar to this server
+#   2. docker load -i airflow-ha.tar
+#   3. docker tag <loaded-id> airflow-ha:2.7.3
+#   4. Test connectivity from this server FIRST:
+#        nc -zv 10.61.241.85 5432    # Must succeed (PostgreSQL via HAProxy)
+#        nc -zv 10.61.241.85 6379    # Must succeed (Redis)
+#        nc -zv 10.61.241.85 26379   # Must succeed (Redis Sentinel)
+#        nc -zv 10.61.241.85 9000    # Must succeed (MinIO)
+#   5. docker compose -f docker-compose-ha-server.yml up -d
+# =============================================================================
+
+x-worker-common: &worker-common
+  image: airflow-ha:2.7.3
+  environment: &worker-env
+    # DB: connects to HAProxy on the Main Server (10.61.241.85:5432)
+    # HAProxy then routes to the Patroni Primary Postgres node
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@10.61.241.85:5432/airflow
+    - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@10.61.241.85:5432/airflow
+
+    # Broker: Redis Sentinels on the Main Server (10.61.241.85)
+    # 3 sentinels are exposed on ports 26379, 26380, 26381
+    - AIRFLOW__CELERY__BROKER_URL=sentinel://10.61.241.85:26379/0;sentinel://10.61.241.85:26380/0;sentinel://10.61.241.85:26381/0
+    - AIRFLOW__CELERY__BROKER_TRANSPORT_OPTIONS={"master_name":"mymaster","sentinel_kwargs":{"password":"redispassword"}}
+
+    - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+    # !! Must be IDENTICAL to the Main Server's Fernet key !!
+    - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    # !! Must be IDENTICAL to the Main Server's secret key !!
+    - AIRFLOW__WEBSERVER__SECRET_KEY=9a8b7c6d5e4f3g2h1i0j9k8l7m6n5o4p
+
+    # Remote logging: MinIO on the Main Server (10.61.241.85:9000)
+    - AIRFLOW__LOGGING__REMOTE_LOGGING=True
+    - AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID=minio_s3_conn
+    - AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER=s3://airflow-logs
+
+    # Worker concurrency — tune based on this server's CPU/RAM
+    - AIRFLOW__CELERY__WORKER_CONCURRENCY=4
+
+  volumes:
+    - dags-volume:/opt/airflow/dags
+    - ./config/airflow.cfg:/opt/airflow/airflow.cfg
+
+services:
+
+  # ── git-sync — pulls DAGs from GitHub ─────────────────────────────────────
+  # Workers need the DAG files to execute tasks.
+  # This pulls the same repo as the Main server every 30 seconds.
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.2.1
+    container_name: git-sync
+    restart: always
+    environment:
+      - GITSYNC_REPO=https://github.com/nishtha-isro/my-airflow-dags.git   # ← CHANGE THIS
+      - GITSYNC_BRANCH=main
+      - GITSYNC_PERIOD=30s
+      - GITSYNC_ROOT=/git
+      - GITSYNC_DEST=dags
+    volumes:
+      - dags-volume:/git
+
+  # ── Celery Worker 1 ────────────────────────────────────────────────────────
+  # Waits for the Main server's DB to be reachable before starting
+  worker:
+    <<: *worker-common
+    container_name: airflow-worker1
+    restart: always
+    command: >
+      sh -c "
+        until nc -z 10.61.241.85 5432; do echo 'Waiting for Main DB...'; sleep 3; done;
+        echo 'DB reachable — starting worker';
+        airflow celery worker
+      "
+    depends_on:
+      - git-sync
+
+  # ── Celery Worker 2 ────────────────────────────────────────────────────────
+  worker2:
+    <<: *worker-common
+    container_name: airflow-worker2
+    restart: always
+    command: >
+      sh -c "
+        until nc -z 10.61.241.85 5432; do echo 'Waiting for Main DB...'; sleep 3; done;
+        echo 'DB reachable — starting worker2';
+        airflow celery worker
+      "
+    depends_on:
+      - git-sync
+
+  # ── Celery Worker 3 ────────────────────────────────────────────────────────
+  worker3:
+    <<: *worker-common
+    container_name: airflow-worker3
+    restart: always
+    command: >
+      sh -c "
+        until nc -z 10.61.241.85 5432; do echo 'Waiting for Main DB...'; sleep 3; done;
+        echo 'DB reachable — starting worker3';
+        airflow celery worker
+      "
+    depends_on:
+      - git-sync
+
+volumes:
+  dags-volume:
