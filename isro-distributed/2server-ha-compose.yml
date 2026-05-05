@@ -1,0 +1,334 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — 2-SERVER SETUP
+# SERVER: HA (10.61.247.142)
+# Roles: ALL Airflow services on ONE server
+#
+# CRITICAL DESIGN DECISIONS for 2-server constraint:
+#
+# 1. etcd   → Runs SINGLE NODE (not a cluster). No quorum issue. Patroni still
+#             manages Postgres failover. When server 3 arrives (Month 1), we
+#             expand etcd to 3-node cluster.
+#
+# 2. Redis  → Runs PRIMARY + REPLICA on same server. Sentinel quorum is set
+#             to 1 (single sentinel). Not true HA for Redis, but Redis failure
+#             is recoverable — Airflow workers retry. The HA server has both.
+#             When server 3 arrives, we add sentinel2/replica2 there.
+#
+# 3. Postgres → Runs SINGLE NODE with Patroni (no replica yet). HAProxy still
+#               fronts it (ready for scale). When server 3 arrives, add pg-node2.
+#
+# 4. Airflow → Webserver, Scheduler (x2 active-active), Workers (x2), Flower,
+#              MinIO all run here.
+#
+# RESULT: If HA server fails → rebuild it (15 min). Main server (85) has no
+#         Airflow services so its failure is non-critical.
+#         True active-active HA comes in Phase 2 (Month 1) and Phase 3 (Month 2).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+x-airflow-common: &airflow-common
+  image: airflow-ha:2.7.3   # built & pushed from main server (10.61.241.85)
+  environment: &airflow-env
+    # ── Database ────────────────────────────────────────────────────────
+    # HAProxy (port 5432) fronts Postgres — ready for replica expansion
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@10.61.247.142:5432/airflow
+    - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@10.61.247.142:5432/airflow
+    # ── Broker — single sentinel (quorum=1 for Phase 1) ─────────────────
+    - AIRFLOW__CELERY__BROKER_URL=sentinel://10.61.247.142:26379/0
+    - AIRFLOW__CELERY__BROKER_TRANSPORT_OPTIONS={"master_name":"mymaster","sentinel_kwargs":{"password":"redispassword"}}
+    # ── Core ─────────────────────────────────────────────────────────────
+    - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+    - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    - AIRFLOW__WEBSERVER__SECRET_KEY=9a8b7c6d5e4f3g2h1i0j9k8l7m6n5o4p
+    - AIRFLOW__WEBSERVER__WORKERS=2
+    # ── Remote Logging (MinIO on same server) ───────────────────────────
+    - AIRFLOW__LOGGING__REMOTE_LOGGING=True
+    - AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID=minio_s3_conn
+    - AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER=s3://airflow-logs
+  volumes:
+    - dags-volume:/opt/airflow/dags
+    - ./config/airflow.cfg:/opt/airflow/airflow.cfg
+
+services:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE LAYER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── etcd SINGLE NODE (Phase 1: no cluster quorum needed) ───────────────────
+  # NOTE: Patroni still uses etcd for leader election but with only 1 node it
+  # works fine. Expand to 3-node when servers 3 & 4 arrive.
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.12
+    restart: always
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ETCD_NAME=etcd1
+      # Single node cluster — only lists itself
+      - ETCD_INITIAL_CLUSTER=etcd1=http://10.61.247.142:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://10.61.247.142:2379
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://10.61.247.142:2380
+      - ETCD_ALLOW_NONE_AUTHENTICATION=yes
+    volumes:
+      - etcd-data:/etcd-data
+
+  # ── Postgres SINGLE NODE with Patroni (Phase 1) ─────────────────────────────
+  # Patroni is ready to add replicas in Phase 2. HAProxy already fronts it.
+  fix-permissions:
+    image: busybox
+    user: root
+    volumes:
+      - pgdata1:/data1
+      - pg-sockets:/run-postgresql
+    command: sh -c "chown -R 1000:1000 /data1 /run-postgresql"
+
+  pg-node1:
+    image: ongres/patroni:latest
+    restart: always
+    ports:
+      - "5433:5432"   # Patroni native port (HAProxy routes 5432 → here)
+      - "8008:8008"   # Patroni REST API
+    depends_on:
+      fix-permissions:
+        condition: service_completed_successfully
+      etcd1:
+        condition: service_started
+    environment:
+      PATRONI_NAME: pg-node1
+      PATRONI_CONFIGURATION: |
+        scope: airflow
+        name: pg-node1
+        etcd3:
+          # Single etcd node for now — expand comma-separated when servers arrive
+          hosts: 10.61.247.142:2379
+        bootstrap:
+          method: initdb
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            postgresql:
+              use_pg_rewind: true
+              parameters:
+                wal_level: replica
+                hot_standby: "on"
+                max_wal_senders: 10
+                max_replication_slots: 10
+                max_connections: 200
+              pg_hba:
+                - host replication replicator 0.0.0.0/0 md5
+                - host all all 0.0.0.0/0 md5
+                - local all all trust
+        postgresql:
+          listen: 0.0.0.0:5432
+          connect_address: 10.61.247.142:5433
+          data_dir: /data/db
+          bin_dir: /usr/lib/postgresql/17.2/bin
+          pgpass: /tmp/pgpass
+          authentication:
+            replication: {username: replicator, password: replicatorpassword}
+            superuser: {username: airflow, password: airflow}
+        restapi:
+          listen: 0.0.0.0:8008
+          connect_address: 10.61.247.142:8008
+    command: patroni
+    volumes:
+      - pgdata1:/data
+      - pg-sockets:/run/postgresql
+
+  # ── HAProxy — DB load balancer (single backend for now, ready to expand) ───
+  haproxy:
+    image: haproxy:latest
+    restart: always
+    ports:
+      - "5432:5432"   # All Airflow services connect here
+      - "7000:7000"   # HAProxy stats dashboard
+    volumes:
+      - ./haproxy/haproxy-2server.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    depends_on:
+      - pg-node1
+
+  # ── Redis Primary ────────────────────────────────────────────────────────────
+  redis-primary:
+    image: redis:7.0
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass redispassword --save 60 1 --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  # ── Redis Sentinel (single sentinel, quorum=1 for Phase 1) ──────────────────
+  # When servers 3 & 4 arrive: add sentinel2/sentinel3 there (quorum stays ≥2)
+  redis-sentinel1:
+    image: redis:7.0
+    restart: always
+    ports:
+      - "26379:26379"
+    volumes:
+      - ./redis-config/sentinel-2server.conf:/etc/sentinel.conf
+    command: redis-sentinel /etc/sentinel.conf
+    depends_on:
+      - redis-primary
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # STORAGE & SYNC LAYER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── MinIO (log storage for all Airflow services) ─────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: always
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    volumes:
+      - ./minio-data:/data
+    command: server /data --console-address ':9001'
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "sleep 5;
+        mc alias set local http://minio:9000 minioadmin minioadmin123;
+        mc mb local/airflow-logs --ignore-existing;
+        mc anonymous set download local/airflow-logs;"
+
+  # ── git-sync (pulls DAGs from GitHub every 30s) ──────────────────────────────
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.2.1
+    restart: always
+    environment:
+      - GITSYNC_REPO=https://github.com/nishtha-isro/my-airflow-dags.git
+      - GITSYNC_BRANCH=main
+      - GITSYNC_PERIOD=30s
+      - GITSYNC_ROOT=/git
+      - GITSYNC_DEST=dags
+    volumes:
+      - dags-volume:/git
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # AIRFLOW LAYER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── DB Init (run ONCE to create tables + admin user) ─────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting for DB...'; sleep 3; done;
+             airflow db migrate &&
+             airflow users create --username admin --password admin
+               --firstname Admin --lastname User --role Admin --email admin@isro.gov.in"
+    depends_on:
+      - haproxy
+
+  # ── Webserver ─────────────────────────────────────────────────────────────────
+  webserver:
+    <<: *airflow-common
+    restart: always
+    ports:
+      - "8085:8080"
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow webserver"
+    depends_on:
+      - airflow-init
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /opt/airflow/airflow-webserver.pid ]"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  # ── Scheduler 1 (primary) ─────────────────────────────────────────────────────
+  scheduler:
+    <<: *airflow-common
+    restart: always
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow scheduler"
+    depends_on:
+      - webserver
+
+  # ── Scheduler 2 (active-active HA — if scheduler1 dies, scheduler2 takes over)
+  scheduler2:
+    <<: *airflow-common
+    restart: always
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow scheduler"
+    depends_on:
+      - webserver
+
+  # ── Worker 1 ─────────────────────────────────────────────────────────────────
+  worker:
+    <<: *airflow-common
+    restart: always
+    environment:
+      <<: *airflow-env
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: "4"
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow celery worker -q default"
+
+  # ── Worker 2 ─────────────────────────────────────────────────────────────────
+  worker2:
+    <<: *airflow-common
+    restart: always
+    environment:
+      <<: *airflow-env
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: "4"
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow celery worker -q default"
+
+  # ── Flower (Celery task monitor) ─────────────────────────────────────────────
+  flower:
+    <<: *airflow-common
+    restart: always
+    ports:
+      - "5557:5555"
+    command: >
+      sh -c "until nc -z 10.61.247.142 5432; do echo 'Waiting...'; sleep 2; done;
+             airflow celery flower"
+    depends_on:
+      - redis-sentinel1
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # MONITORING LAYER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  dags-volume:
+  pgdata1:
+  pg-sockets:
+  redis-data:
+  etcd-data:
+  grafana-data:

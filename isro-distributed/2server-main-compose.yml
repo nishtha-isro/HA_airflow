@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — 2-SERVER SETUP
+# SERVER: MAIN (10.61.241.85)
+# Roles: Local Docker Registry (:5000), Registry UI (:5001), pgAdmin (:5050)
+#
+# This server does NOT run Airflow workloads.
+# It is the build/image distribution server.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Local Docker Registry (so HA server can pull images) ───────────────────
+  registry:
+    image: registry:2
+    restart: always
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    restart: always
+    ports:
+      - "5001:80"
+    environment:
+      - REGISTRY_URL=http://10.61.241.85:5000
+      - REGISTRY_TITLE=ISRO Airflow Registry
+      - DELETE_IMAGES=true
+
+  # ── pgAdmin (DB management GUI — optional but useful) ──────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: always
+    ports:
+      - "5050:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@isro.gov.in
+      - PGADMIN_DEFAULT_PASSWORD=admin123
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+
+volumes:
+  registry-data:
+  pgadmin-data:

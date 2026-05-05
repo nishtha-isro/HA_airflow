@@ -1,17 +1,33 @@
 # monitoring/prometheus.yml
+# Phase 1 (2-server): scraping Airflow webserver only.
+# All services are on the same Docker network (HA server 10.61.247.142),
+# so Docker service names resolve correctly within compose.
+
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
 scrape_configs:
+  # Airflow built-in metrics endpoint
   - job_name: 'airflow'
     static_configs:
       - targets: ['webserver:8080']
+    metrics_path: '/metrics'
 
-  - job_name: 'redis'
+  # Flower (Celery task monitor)
+  - job_name: 'flower'
     static_configs:
-      - targets: ['redis-exporter:9121']
+      - targets: ['flower:5555']
 
-  - job_name: 'postgres'
+  # HAProxy stats (in Prometheus format via stats endpoint)
+  - job_name: 'haproxy'
     static_configs:
-      - targets: ['postgres-exporter:9187']
+      - targets: ['haproxy:7000']
+
+  # Phase 2 (Month 1): add redis-exporter and postgres-exporter sidecars
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']
+  # - job_name: 'postgres'
+  #   static_configs:
+  #     - targets: ['postgres-exporter:9187']
